@@ -18,21 +18,40 @@ if "prices_df" not in st.session_state:
     st.session_state.trades_df = pd.DataFrame()
     st.session_state.backtest_result = None
 
-# ---------------- SAFE FUNCTIONS ----------------
+# ---------------- SAFE ----------------
 def safe_df(df):
     return df.copy() if df is not None and not df.empty else pd.DataFrame()
+
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except:
+        return default
 
 def run_backtest(strategy_cls, prices, trades, params):
     try:
         strat = strategy_cls()
-        return strat.run(prices, trades, **params)
+        res = strat.run(prices, trades, **params)
+
+        # 🔥 SAFETY FIXES
+        if not hasattr(res, "equity_curve") or res.equity_curve is None:
+            raise ValueError("No equity_curve returned")
+
+        if not hasattr(res, "timestamps"):
+            res.timestamps = pd.Series(range(len(res.equity_curve)))
+
+        if not hasattr(res, "trades"):
+            res.trades = pd.DataFrame(columns=["pnl"])
+
+        return res
+
     except Exception as e:
         st.error(f"❌ Backtest failed: {e}")
         return None
 
 @st.cache_data
-def cached_metrics(equity):
-    return compute_all_metrics(equity)
+def cached_metrics(equity, trades):
+    return compute_all_metrics(equity, trades)
 
 # ---------------- SIDEBAR ----------------
 st.sidebar.title("⚙️ Controls")
@@ -64,22 +83,16 @@ for p in schema:
     name = p["name"]
     default = p.get("default", 0)
 
+    # 🔥 FIX: consistent float everywhere
+    min_v = safe_float(p.get("min", 0))
+    max_v = safe_float(p.get("max", 100))
+    step  = safe_float(p.get("step", 1))
+    val0  = safe_float(default)
+
     if p["type"] == "slider":
-        val = st.sidebar.slider(
-            name,
-            float(p["min"]),
-            float(p["max"]),
-            float(default),
-            float(p["step"])
-        )
+        val = st.sidebar.slider(name, min_v, max_v, val0, step)
     elif p["type"] == "number":
-        val = st.sidebar.number_input(
-            name,
-            min_value=float(p["min"]),
-            max_value=float(p["max"]),
-            value=float(default),
-            step=float(p["step"])
-        )
+        val = st.sidebar.number_input(name, min_value=min_v, max_value=max_v, value=val0, step=step)
     else:
         val = default
 
@@ -94,9 +107,18 @@ if st.sidebar.button("🚀 Run Backtest"):
             safe_df(st.session_state.trades_df),
             params
         )
+
+        # 🔍 DEBUG (VERY IMPORTANT)
+        if result is not None:
+            st.write("📊 Equity sample:", result.equity_curve.head())
+            st.write("📊 Equity std:", result.equity_curve.std())
+
+            if hasattr(result, "trades"):
+                st.write("📊 Trades sample:", result.trades.head())
+
         st.session_state.backtest_result = result
 
-# ---------------- MAIN UI ----------------
+# ---------------- MAIN ----------------
 st.title("📈 Prosperity Pro Backtester")
 
 result = st.session_state.backtest_result
@@ -106,12 +128,18 @@ if result is None:
     st.stop()
 
 # ---------------- METRICS ----------------
-metrics = compute_all_metrics(result.equity_curve, result.trades)
+metrics = cached_metrics(result.equity_curve, result.trades)
+
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("PnL", round(metrics["Final PnL"], 2))
-col2.metric("Sharpe", round(metrics["Sharpe Ratio"], 2))
-col3.metric("Drawdown", round(metrics["Max Drawdown"], 2))
+
+col1.metric("PnL", safe_float(metrics.get("Final PnL")))
+col2.metric("Sharpe", safe_float(metrics.get("Sharpe Ratio")))
+col3.metric("Drawdown", safe_float(metrics.get("Max Drawdown")))
 col4.metric("Trades", metrics.get("Total Trades", 0))
+
+# ---------------- CHECK (IMPORTANT) ----------------
+if result.equity_curve.std() == 0:
+    st.warning("⚠️ Strategy not trading (equity flat)")
 
 # ---------------- TABS ----------------
 tabs = st.tabs(["📈 Equity", "📊 Sharpe", "🔥 Optimizer"])
@@ -119,17 +147,19 @@ tabs = st.tabs(["📈 Equity", "📊 Sharpe", "🔥 Optimizer"])
 # ---- EQUITY ----
 with tabs[0]:
     drawdown = compute_drawdown_series(result.equity_curve)
+
     fig = equity_curve_chart(
         result.equity_curve,
         result.timestamps,
         drawdown,
-        result.strategy_name
+        strategy_name
     )
     st.plotly_chart(fig, use_container_width=True)
 
 # ---- SHARPE ----
 with tabs[1]:
     rs = rolling_sharpe(result.equity_curve, 100)
+
     fig2 = rolling_sharpe_chart(rs, result.timestamps)
     st.plotly_chart(fig2, use_container_width=True)
 
@@ -139,6 +169,10 @@ with tabs[2]:
 
     if st.button("Run Optimization"):
         df = safe_df(st.session_state.prices_df)
+
+        if df.empty:
+            st.error("No data available")
+            st.stop()
 
         x_vals = np.linspace(1, 10, 4)
         y_vals = np.linspace(1, 10, 4)
@@ -150,15 +184,17 @@ with tabs[2]:
 
         for i, (xv, yv) in enumerate(itertools.product(x_vals, y_vals)):
             p = dict(params)
+
             key = list(p.keys())[0]
             p[key] = xv
 
             try:
                 res = run_backtest(strategy_cls, df, pd.DataFrame(), p)
-                if res is None:
+
+                if res is None or res.equity_curve.std() == 0:
                     continue
 
-                m = cached_metrics(res.equity_curve)
+                m = compute_all_metrics(res.equity_curve)
 
                 rows.append({
                     "x": xv,
@@ -166,6 +202,7 @@ with tabs[2]:
                     "PnL": m["Final PnL"],
                     "Sharpe": m["Sharpe Ratio"]
                 })
+
             except:
                 pass
 
@@ -178,3 +215,5 @@ with tabs[2]:
             st.success(f"🏆 Best Sharpe: {best['Sharpe']:.2f}")
 
             st.dataframe(opt_df, use_container_width=True)
+        else:
+            st.warning("⚠️ No valid strategies found")
