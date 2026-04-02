@@ -106,8 +106,7 @@ if result is None:
     st.stop()
 
 # ---------------- METRICS ----------------
-metrics = cached_metrics(result.equity_curve)
-
+metrics = compute_all_metrics(result.equity_curve, result.trades)
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("PnL", round(metrics["Final PnL"], 2))
 col2.metric("Sharpe", round(metrics["Sharpe Ratio"], 2))
